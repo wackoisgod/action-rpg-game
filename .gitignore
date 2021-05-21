@@ -7,3 +7,4 @@ Client/Assembly-CSharp.csproj
 Client/*.csproj
 **/obj
 **/bin
+Client/Temp
