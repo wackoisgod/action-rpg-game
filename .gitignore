@@ -8,3 +8,4 @@ Client/*.csproj
 **/obj
 **/bin
 Client/Temp
+Client/.idea

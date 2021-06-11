@@ -1,16 +1,52 @@
 using System;
-using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 
 using UnityEditor;
 
-using UnityEngine;
-
 public class SolutionFilePostprocessor : AssetPostprocessor
 {
+    public static class SolutionGuidGenerator
+    {
+        public static string GuidForProject(string projectName)
+        {
+            return ComputeGuidHashFor(projectName + "salt");
+        }
+
+        public static string GuidForSolution(string projectName, bool isSDK)
+        {
+            if (!isSDK) {
+                return "FAE04EC0-301F-11D3-BF4B-00C04F79EFBC";
+            }
+
+            return "9A19103F-16F7-4668-BE54-9A1E7A4F7556";
+        }
+
+        private static string ComputeGuidHashFor(string input)
+        {
+            var hash = MD5.Create().ComputeHash(Encoding.Default.GetBytes(input));
+            return HashAsGuid(HashToString(hash));
+        }
+
+        private static string HashAsGuid(string hash)
+        {
+            var guid = hash.Substring(0, 8) + "-" + hash.Substring(8, 4) + "-" + hash.Substring(12, 4) + "-" + hash.Substring(16, 4) + "-" + hash.Substring(20, 12);
+            return guid.ToUpper();
+        }
+
+        private static string HashToString(byte[] bs)
+        {
+            var sb = new StringBuilder();
+            foreach (byte b in bs)
+                sb.Append(b.ToString("x2"));
+            return sb.ToString();
+        }
+    }
+
     internal class Solution
     {
         public SolutionProjectEntry[] Projects { get; set; }
@@ -124,8 +160,12 @@ public class SolutionFilePostprocessor : AssetPostprocessor
     }
 
     const string k_WindowsNewline = "\r\n";
-    string m_SolutionProjectEntryTemplate = @"Project(""{{{0}}}"") = ""{1}"", ""{2}"", ""{{{3}}}""{4}EndProject";
-
+    static string m_SolutionProjectEntryTemplate = @"Project(""{{{0}}}"") = ""{1}"", ""{2}"", ""{{{3}}}""{4}EndProject";
+    static string m_SolutionProjectConfigurationTemplate = string.Join("\r\n",
+    @"        {{{0}}}.Debug|Any CPU.ActiveCfg = Debug|Any CPU",
+    @"        {{{0}}}.Debug|Any CPU.Build.0 = Debug|Any CPU",
+    @"        {{{0}}}.Release|Any CPU.ActiveCfg = Release|Any CPU",
+    @"        {{{0}}}.Release|Any CPU.Build.0 = Release|Any CPU").Replace("    ", "\t");
     private static string GetPropertiesText(SolutionProperties[] array)
     {
         if (array == null || array.Length == 0) {
@@ -160,7 +200,7 @@ public class SolutionFilePostprocessor : AssetPostprocessor
         return result.ToString();
     }
 
-    private string GetProjectEntriesText(IEnumerable<SolutionProjectEntry> entries)
+    private static string GetProjectEntriesText(IEnumerable<SolutionProjectEntry> entries)
     {
         var projectEntries = entries.Select(entry => string.Format(
             m_SolutionProjectEntryTemplate,
@@ -170,10 +210,144 @@ public class SolutionFilePostprocessor : AssetPostprocessor
         return string.Join(k_WindowsNewline, projectEntries.ToArray());
     }
 
+    private static string GetProjectActiveConfigurations(string projectGuid)
+    {
+        return string.Format(
+            m_SolutionProjectConfigurationTemplate,
+            projectGuid);
+    }
+
+    public static bool IsExternalFile(string root, string project)
+    {
+        if (string.IsNullOrEmpty(project))
+            return false;
+
+        var fullProjectPath = Path.GetFullPath(project);
+
+        var slnRoot = Path.GetDirectoryName(root);
+        var projectRoot = Path.GetDirectoryName(fullProjectPath);
+
+        return projectRoot != slnRoot;
+    }
+
+    public static string GetRelativePath(string fromPath, string toPath)
+    {
+        if (string.IsNullOrEmpty(fromPath)) {
+            throw new ArgumentNullException("fromPath");
+        }
+
+        if (string.IsNullOrEmpty(toPath)) {
+            throw new ArgumentNullException("toPath");
+        }
+
+        Uri fromUri = new Uri(AppendDirectorySeparatorChar(fromPath));
+        Uri toUri = new Uri(AppendDirectorySeparatorChar(toPath));
+
+        if (fromUri.Scheme != toUri.Scheme) {
+            return toPath;
+        }
+
+        Uri relativeUri = fromUri.MakeRelativeUri(toUri);
+        string relativePath = Uri.UnescapeDataString(relativeUri.ToString());
+
+        if (string.Equals(toUri.Scheme, Uri.UriSchemeFile, StringComparison.OrdinalIgnoreCase)) {
+            relativePath = relativePath.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
+        }
+
+        return relativePath;
+    }
+
+    private static string AppendDirectorySeparatorChar(string path)
+    {
+        if (!Path.HasExtension(path) &&
+            !path.EndsWith(Path.DirectorySeparatorChar.ToString())) {
+            return path + Path.DirectorySeparatorChar;
+        }
+
+        return path;
+    }
+
     public static string OnGeneratedSlnSolution(string path, string content)
     {
+        const string fileversion = "12.00";
+        const string vsversion = "15";
+
         var solution = SolutionParser.ParseSolutionContent(content);
-       
-        return content;
+
+        var xx = Path.GetFullPath(solution.Projects[0].FileName);
+
+        var externalProjects = solution.Projects.Where(x => IsExternalFile(path, x.FileName));
+
+        var wtf = Directory.GetParent(path).Parent.FullName;
+        var searchPath = Path.Combine(wtf, "Source");
+        if (!Directory.Exists(searchPath))
+            return content;
+
+        var csProjs = Directory.GetFiles(searchPath, "*.csproj", SearchOption.AllDirectories);
+        var newProjects = new List<SolutionProjectEntry>();
+
+        if (csProjs.Any()) {
+            // we have found some project files;
+            foreach (var proj in csProjs) {
+                var fileName = Path.GetFileNameWithoutExtension(proj);
+                var alreadyExists = externalProjects.Any(y => y.Name == fileName);
+                if (alreadyExists)
+                    continue;
+
+                var relativePath = GetRelativePath(path, proj);
+                newProjects.Add(new SolutionProjectEntry() {
+                    ProjectFactoryGuid = SolutionGuidGenerator.GuidForSolution(fileName, true),
+                    Name = fileName,
+                    FileName = relativePath,
+                    ProjectGuid = SolutionGuidGenerator.GuidForProject(fileName),
+                    Metadata = k_WindowsNewline
+                });
+            }
+        }
+
+        var currentProjects = solution.Projects.ToList();
+        var currentProperties = solution.Properties.ToList();
+
+        if (newProjects.Any()) {
+
+            var solutionFolder = solution.Projects.Where(p => p.IsSolutionFolderProjectFactory()).FirstOrDefault();
+            if (solutionFolder == null) {
+                // we need to create a new external folder
+                solutionFolder = new SolutionProjectEntry() {
+                    ProjectFactoryGuid = "2150E333-8FDC-42A3-9474-1A3956D46DE8",
+                    Name = "External",
+                    FileName = "External",
+                    ProjectGuid = "EC53F180-D7F9-46DF-B6A5-54511207D496",
+                    Metadata = k_WindowsNewline
+                };
+
+                currentProjects.Add(solutionFolder);
+            }
+
+            var hasNestedProjectsProperty = solution.Properties.Where(pp => pp.Name == "NestedProjects").FirstOrDefault();
+            if (hasNestedProjectsProperty == null) {
+                hasNestedProjectsProperty = new SolutionProperties() {
+                    Name = "NestedProjects",
+                    Type = "preSolution",
+                    Entries = new List<KeyValuePair<string, string>>()
+                };
+            }
+
+            foreach (var item in newProjects) {
+                hasNestedProjectsProperty.Entries.Add(new KeyValuePair<string, string>($"{{{item.ProjectGuid}}}", $"{{{solutionFolder.ProjectGuid}}}"));
+            }
+
+            currentProperties.Add(hasNestedProjectsProperty);
+            currentProjects.AddRange(newProjects);
+        }
+
+        string propertiesText = GetPropertiesText(currentProperties.ToArray());
+        string projectEntriesText = GetProjectEntriesText(currentProjects);
+
+        var configurableProjects = currentProjects.Where(p => !p.IsSolutionFolderProjectFactory());
+        string projectConfigurationsText = string.Join(k_WindowsNewline, configurableProjects.Select(p => GetProjectActiveConfigurations(p.ProjectGuid)).ToArray());
+
+        var newSolution = string.Format(GetSolutionText(), fileversion, vsversion, projectEntriesText, projectConfigurationsText, propertiesText);
+        return newSolution;
     }
 }
